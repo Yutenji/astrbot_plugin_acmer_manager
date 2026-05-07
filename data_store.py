@@ -229,6 +229,18 @@ class DataStore:
                 ).fetchone()
         return int(row[0]) if row else 0
 
+    def list_solved_ids(self, qq_id: int, platform: str) -> set[str]:
+        """获取指定平台已做题目的 problem_id 列表。"""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT problem_id FROM solved_problems
+                WHERE qq_id = ? AND platform = ?;
+                """,
+                (qq_id, platform),
+            ).fetchall()
+        return {row[0] for row in rows}
+
     def list_solved(
         self, qq_id: int, platform: Optional[str] = None, limit: int = 10
     ) -> Iterable[Tuple[str, str, str, str, str, int]]:

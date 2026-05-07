@@ -1,9 +1,12 @@
 import hashlib
 import os
 import asyncio
+import random
+import re
 from typing import Iterable
 
 import aiohttp
+from bs4 import BeautifulSoup
 from aiohttp import web
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
@@ -324,4 +327,305 @@ class ACMerManager(Star):
         except Exception as e:
             logger.error(f"绑定账号时发生错误: {e}")
             yield event.plain_result("绑定失败，后台发生错误。")
+
+    async def _fetch_cf_problemset(self):
+        url = "https://codeforces.com/api/problemset.problems"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    data = await resp.json()
+                    if data.get("status") == "OK":
+                        return data["result"]["problems"]
+        except Exception as e:
+            logger.error(f"CF Problemset API error: {e}")
+        return None
+
+    async def _fetch_cf_problem_statement(self, contest_id: int, index: str):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        }
+        url = f"https://codeforces.com/problemset/problem/{contest_id}/{index}"
+        mirror_url = f"https://mirror.codeforces.com/problemset/problem/{contest_id}/{index}"
+
+        async with aiohttp.ClientSession(headers=headers) as session:
+            html = None
+            for try_url in (url, mirror_url):
+                try:
+                    async with session.get(try_url, timeout=15) as resp:
+                        if resp.status == 200:
+                            html = await resp.text()
+                            break
+                except Exception:
+                    continue
+
+            if html is None:
+                return None
+
+        soup = BeautifulSoup(html, 'html.parser')
+
+        title_tag = soup.find('div', class_='title')
+        title = title_tag.text.strip() if title_tag else f"{contest_id}{index}"
+
+        problem_statement = soup.find('div', class_='problem-statement')
+        if not problem_statement:
+            return None
+
+        description_html = ""
+        input_spec_html = ""
+        output_spec_html = ""
+        note_html = ""
+
+        desc_div = None
+        for div in problem_statement.find_all('div', recursive=False):
+            if 'header' in div.get('class', []):
+                continue
+            if 'input-specification' in div.get('class', []):
+                input_spec_html = str(div)
+            elif 'output-specification' in div.get('class', []):
+                output_spec_html = str(div)
+            elif 'note' in div.get('class', []):
+                note_html = str(div)
+            elif 'sample-tests' not in div.get('class', []) and desc_div is None:
+                desc_div = div
+
+        if desc_div:
+            description_html = str(desc_div)
+
+        sample_tests = []
+        sample_blocks = problem_statement.find_all('div', class_='sample-test')
+        if not sample_blocks:
+            sample_inputs = problem_statement.find_all('div', class_='input')
+            sample_outputs = problem_statement.find_all('div', class_='output')
+            for inp_div, out_div in zip(sample_inputs, sample_outputs):
+                inp_pre = inp_div.find('pre')
+                out_pre = out_div.find('pre')
+                if inp_pre and out_pre:
+                    sample_tests.append({
+                        "input": inp_pre.get_text('\n').strip(),
+                        "output": out_pre.get_text('\n').strip()
+                    })
+        else:
+            for block in sample_blocks:
+                input_divs = block.find_all('div', class_='input')
+                output_divs = block.find_all('div', class_='output')
+                for inp_div, out_div in zip(input_divs, output_divs):
+                    inp_pre = inp_div.find('pre')
+                    out_pre = out_div.find('pre')
+                    if inp_pre and out_pre:
+                        sample_tests.append({
+                            "input": inp_pre.get_text('\n').strip(),
+                            "output": out_pre.get_text('\n').strip()
+                        })
+
+        return {
+            "title": title,
+            "description": description_html,
+            "input_spec": input_spec_html,
+            "output_spec": output_spec_html,
+            "sample_tests": sample_tests,
+            "note": note_html
+        }
+
+    def _strip_cf_section_titles(self, html_text):
+        if not html_text:
+            return html_text
+        soup = BeautifulSoup(html_text, 'html.parser')
+        for div in soup.find_all('div', class_='section-title'):
+            div.decompose()
+        return str(soup)
+
+    @filter.command("每日一题", alias={"daily"})
+    async def daily_cf(self, event: AstrMessageEvent):
+        """ Codeforces 每日一题抓取推送 """
+        qq_id = self._resolve_qq_id(event)
+        
+        min_rating = 0
+        max_rating = 1300
+        
+        user = self.db.get_user(qq_id) if qq_id else None
+        if user and user.cf_handle and user.cf_rating:
+            min_rating = max(0, user.cf_rating - 50)
+            max_rating = user.cf_rating + 300
+
+        yield event.plain_result(f"正在抓取难度区间 {min_rating}~{max_rating} 的题目，请稍候...")
+
+        problems = await self._fetch_cf_problemset()
+        if not problems:
+            yield event.plain_result("获取题库列表失败，请稍后再试。")
+            return
+
+        filtered = [p for p in problems if "rating" in p and min_rating <= p["rating"] <= max_rating]
+        if not filtered:
+            yield event.plain_result(f"在 {min_rating}~{max_rating} 区间内未找到可用的题目。")
+            return
+
+        def build_problem_id(problem_item: dict) -> str:
+            contest_id_val = problem_item.get("contestId")
+            index_val = problem_item.get("index")
+            rating_val = str(problem_item.get("rating", ""))
+            name_val = problem_item.get("name") or "Unknown Problem"
+            if contest_id_val and index_val:
+                return f"cf_{contest_id_val}{index_val}"
+            name_norm = "".join(c for c in name_val if c.isalnum()).lower()
+            return f"cf_{name_norm}_{rating_val or 'unknown'}"
+
+        solved_ids: set[str] = set()
+        if qq_id is not None:
+            solved_ids = self.db.list_solved_ids(qq_id, "cf")
+
+        unsolved = [p for p in filtered if build_problem_id(p) not in solved_ids]
+        candidates = unsolved if unsolved else filtered
+
+        contest_ids = [p.get("contestId", 0) or 0 for p in candidates]
+        min_contest = min(contest_ids) if contest_ids else 0
+        max_contest = max(contest_ids) if contest_ids else 0
+
+        weights: list[float] = []
+        for p in candidates:
+            contest_id_val = p.get("contestId", 0) or 0
+            rating_val = p.get("rating", 0) or 0
+            weight = 1.0
+
+            # Prefer newer problems by contest id.
+            if max_contest > min_contest:
+                newness = (contest_id_val - min_contest) / (max_contest - min_contest)
+                weight *= 1.0 + 2.0 * newness
+
+            # Down-weight older low-rated problems.
+            if rating_val <= 800:
+                weight *= 0.2
+            elif rating_val <= 1000:
+                weight *= 0.4
+
+            weights.append(max(weight, 0.0))
+
+        if any(w > 0 for w in weights):
+            problem = random.choices(candidates, weights=weights, k=1)[0]
+        else:
+            problem = random.choice(candidates)
+        contest_id = problem.get("contestId")
+        index = problem.get("index")
+        rating = problem.get("rating", "未知")
+        problem_url = f"https://codeforces.com/problemset/problem/{contest_id}/{index}"
+
+        statement = await self._fetch_cf_problem_statement(contest_id, index)
+        if not statement:
+            yield event.plain_result(f"题目详情抓取失败，请直接访问链接：\n{problem_url}")
+            return
+            
+        def process_cf_html(text):
+            if not text:
+                return ""
+            return re.sub(r'\$\$\$(.*?)\$\$\$', r'\\(\1\\)', text, flags=re.DOTALL)
+
+        description = process_cf_html(statement["description"])
+        input_spec = process_cf_html(self._strip_cf_section_titles(statement["input_spec"]))
+        output_spec = process_cf_html(self._strip_cf_section_titles(statement["output_spec"]))
+        note = process_cf_html(self._strip_cf_section_titles(statement["note"]))
+        def html_to_text(html_text: str) -> str:
+            if not html_text:
+                return ""
+            soup = BeautifulSoup(html_text, "html.parser")
+            return soup.get_text("\n").strip()
+
+        samples_html = ""
+        if statement["sample_tests"]:
+            samples_html = '<div class="section-title">样例 (Examples)</div>'
+            for i, sample in enumerate(statement["sample_tests"]):
+                samples_html += f'''
+                <div class="sample-block">
+                    <div class="sample-title">Input #{i+1}</div>
+                    <pre>{sample["input"]}</pre>
+                    <div class="sample-title">Output #{i+1}</div>
+                    <pre>{sample["output"]}</pre>
+                </div>'''
+
+        note_html = ""
+        if note:
+            note_html = (
+                f'<div class="section-title">备注 (Note)</div>'
+                f'<div class="note-content cf-content">{note}</div>'
+            )
+
+        tmpl = f'''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <script>
+                window.MathJax = {{
+                    tex: {{
+                        inlineMath: [['$', '$'], ['\\(', '\\)']],
+                        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+                        processEscapes: true, processEnvironments: true
+                    }}
+                }};
+            </script>
+            <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js" async></script>
+            <style>
+                body {{ font-family: "Segoe UI", Arial, sans-serif; color: #24292e; padding: 40px; background: #f2f5f8; }}
+                .container {{ background: white; border-radius: 12px; padding: 30px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); max-width: 900px; margin: 0 auto; }}
+                .title {{ font-size: 24px; font-weight: bold; margin-bottom: 5px; }}
+                .subtitle {{ color: #666; font-size: 14px; margin-bottom: 20px; }}
+                .section-title {{ font-size: 18px; font-weight: bold; margin: 20px 0 10px 0; border-bottom: 1px solid #eee; padding-bottom: 5px; }}
+                pre {{ background: #f6f8fa; padding: 12px; border-radius: 6px; font-family: monospace; white-space: pre-wrap; font-size: 14px; }}
+                .note-content {{ background: #fdfdfd; padding: 12px; border-left: 4px solid #0366d6; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="title">{statement["title"]}</div>
+                <div class="subtitle">Codeforces {contest_id}{index} | Rating: {rating} | 链接: {problem_url}</div>
+                <div class="section-title">题目描述 (Description)</div>
+                <div class="cf-content">{description}</div>
+                <div class="section-title">输入格式 (Input)</div>
+                <div class="cf-content">{input_spec}</div>
+                <div class="section-title">输出格式 (Output)</div>
+                <div class="cf-content">{output_spec}</div>
+                {samples_html}
+                {note_html}
+            </div>
+        </body>
+        </html>
+        '''
+
+        try:
+            url = await self.html_render(tmpl, {})
+            yield event.image_result(url)
+        except Exception as e:
+            logger.error(f"图片渲染失败: {e}")
+            desc_text = html_to_text(description)
+            input_text = html_to_text(input_spec)
+            output_text = html_to_text(output_spec)
+            note_text = html_to_text(note)
+            lines = [
+                f"今日一题：{statement['title']}",
+                f"Codeforces {contest_id}{index} | Rating: {rating}",
+                f"链接：{problem_url}",
+                "",
+                "题目描述：",
+                desc_text or "(空)",
+                "",
+                "输入：",
+                input_text or "(空)",
+                "",
+                "输出：",
+                output_text or "(空)",
+            ]
+
+            if statement["sample_tests"]:
+                lines.append("")
+                lines.append("样例：")
+                for i, sample in enumerate(statement["sample_tests"], start=1):
+                    lines.append(f"Input #{i}:")
+                    lines.append(sample["input"] or "(空)")
+                    lines.append(f"Output #{i}:")
+                    lines.append(sample["output"] or "(空)")
+
+            if note_text:
+                lines.append("")
+                lines.append("备注：")
+                lines.append(note_text)
+
+            yield event.plain_result("\n".join(lines))
 
